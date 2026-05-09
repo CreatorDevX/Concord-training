@@ -37,7 +37,7 @@ class TestLoadBalance:
         router.eval()
 
         x = torch.randn(2, 32, config.d_model, device=device)
-        indices, _ = router(x)
+        indices, _, _ = router(x)
         unique_experts = indices.unique()
         # Should use a good fraction of experts
         assert len(unique_experts) >= config.n_experts // 4, (
@@ -76,5 +76,5 @@ class TestLoadBalance:
         ).to(device)
 
         x = torch.randn(1, 8, config.d_model, device=device)
-        out = moe(x)
+        out, _ = moe(x)
         assert (out.abs().sum(dim=-1) > 0).all(), "Some tokens were dropped"

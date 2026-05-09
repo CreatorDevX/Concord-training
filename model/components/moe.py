@@ -3,7 +3,7 @@ MoE Block — Router + Shared Expert + Routed Experts + dispatch_and_combine.
 
 Architecture:
     shared_out  = shared_expert(x)
-    indices, scores = router(x)
+    indices, scores, aux_loss = router(x)
     routed_out  = dispatch_and_combine(x, indices, scores, experts)
     output      = shared_out + routed_out
 
@@ -15,7 +15,7 @@ dispatch_and_combine:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List
+from typing import Dict, List, Tuple, Callable
 
 from model.components.expert import ExpertFFN
 from model.components.router import MLPRouter
@@ -51,28 +51,29 @@ def dispatch_and_combine(
     indices_flat = indices.view(B * T, n_routed)        # (N, n_routed)
     scores_flat = scores.view(B * T, n_routed)          # (N, n_routed)
 
-    # Output accumulator
-    output = torch.zeros_like(x_flat)                   # (N, d)
+    output = torch.zeros_like(x_flat)
 
-    # Process each routing slot
     for slot in range(n_routed):
-        slot_indices = indices_flat[:, slot]             # (N,) — expert id per token
-        slot_scores = scores_flat[:, slot]               # (N,) — score per token
+        slot_indices = indices_flat[:, slot]
+        slot_scores = scores_flat[:, slot]
 
-        # Group tokens by expert
         for expert_idx in range(n_experts):
             mask = (slot_indices == expert_idx)
             if not mask.any():
                 continue
 
-            # Gather tokens for this expert
-            expert_input = x_flat[mask]                  # (n_tokens, d)
+            expert_input = x_flat[mask]
+            expert_output = experts[expert_idx](expert_input)
 
-            # Forward through expert
-            expert_output = experts[expert_idx](expert_input)  # (n_tokens, d)
+            # Sanitize expert output: SwiGLU in fp16 can overflow on edge cases
+            if expert_output.dtype == torch.float16 or expert_output.dtype == torch.bfloat16:
+                expert_output = torch.where(
+                    torch.isnan(expert_output) | torch.isinf(expert_output),
+                    torch.zeros_like(expert_output),
+                    expert_output
+                )
 
-            # Weight by score and accumulate
-            expert_scores = slot_scores[mask].unsqueeze(-1)    # (n_tokens, 1)
+            expert_scores = slot_scores[mask].unsqueeze(-1)
             output[mask] += expert_scores * expert_output
 
     return output.view(B, T, d)
@@ -123,16 +124,25 @@ def dispatch_and_combine_fast(
     unique_experts, counts = torch.unique(indices_sorted, return_counts=True)
     expert_counts[unique_experts] = counts
 
-    # Process each expert's batch
     output_sorted = torch.zeros_like(x_sorted)
     offset = 0
     for expert_idx in range(n_experts):
         count = expert_counts[expert_idx].item()
         if count == 0:
+            if x.requires_grad:
+                dummy_input = x_sorted[:1] * 0.0
+                dummy_out = experts[expert_idx](dummy_input) * 0.0
+                output_sorted[:1] = output_sorted[:1] + dummy_out
             continue
 
         expert_input = x_sorted[offset:offset + count]
         expert_output = experts[expert_idx](expert_input)
+        if expert_output.dtype == torch.float16 or expert_output.dtype == torch.bfloat16:
+            expert_output = torch.where(
+                torch.isnan(expert_output) | torch.isinf(expert_output),
+                torch.zeros_like(expert_output),
+                expert_output
+            )
         output_sorted[offset:offset + count] = expert_output
         offset += count
 
@@ -154,6 +164,8 @@ class MoEBlock(nn.Module):
     Mixture of Experts block.
 
     Combines a shared expert with routed experts via an MLP router.
+    Now propagates auxiliary load balancing loss.
+    Supports activation recomputation for memory-efficient training.
 
     Args:
         d_model: model dimension
@@ -163,7 +175,8 @@ class MoEBlock(nn.Module):
         expert_intermediate: FFN intermediate dim per expert
         router_hidden: router MLP hidden dim
         router_bias_update_interval: steps between bias updates
-        expert_dtype: weight storage dtype ("fp8" or "bf16")
+        expert_dtype: weight storage dtype ("fp16" or "bf16")
+        use_activation_recomputation: if True, checkpoint the routed computation
     """
 
     def __init__(
@@ -175,12 +188,14 @@ class MoEBlock(nn.Module):
         expert_intermediate: int = 192,
         router_hidden: int = 384,
         router_bias_update_interval: int = 1000,
-        expert_dtype: str = "fp8",
+        expert_dtype: str = "fp16",
+        use_activation_recomputation: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_experts = n_experts
         self.n_routed = n_routed
+        self.use_activation_recomputation = use_activation_recomputation
 
         # Router
         self.router = MLPRouter(
@@ -193,39 +208,58 @@ class MoEBlock(nn.Module):
 
         # Shared expert(s) — always in full precision
         self.shared_experts = nn.ModuleList([
-            ExpertFFN(d_model, expert_intermediate, dtype="bf16")
+            ExpertFFN(d_model, expert_intermediate)
             for _ in range(n_shared)
         ])
 
         # Routed experts
         self.routed_experts = nn.ModuleList([
-            ExpertFFN(d_model, expert_intermediate, dtype=expert_dtype)
+            ExpertFFN(d_model, expert_intermediate)
             for _ in range(n_experts)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_routed(self, x: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """Dispatch and combine routed experts (wrapped for checkpointing).
+        
+        Uses the memory-efficient dispatch (no B*T*n_routed expansion) to
+        avoid OOM on long sequences with large batch sizes.
+        """
+        return dispatch_and_combine(x, indices, scores, self.routed_experts)
+
+    def _forward_with_checkpoint(
+        self, x: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor
+    ) -> torch.Tensor:
+        """Routed forward with activation recomputation to save memory."""
+        return torch.utils.checkpoint.checkpoint(
+            self._forward_routed, x, indices, scores, use_reentrant=False
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, T, d_model)
         Returns:
-            (B, T, d_model)
+            output: (B, T, d_model)
+            aux_loss: scalar — router load balancing loss
         """
-        # Shared expert(s)
+        # Shared expert(s) — lightweight, kept outside checkpoint
         shared_out = sum(expert(x.view(-1, self.d_model)).view(x.shape)
                         for expert in self.shared_experts)
 
         # Route
-        indices, scores = self.router(x)
+        indices, scores, aux_loss = self.router(x)
 
-        # Dispatch and combine routed experts
-        routed_out = dispatch_and_combine_fast(x, indices, scores, self.routed_experts)
+        # Dispatch and combine routed experts with optional activation recomputation
+        if self.training and self.use_activation_recomputation:
+            routed_out = self._forward_with_checkpoint(x, indices, scores)
+        else:
+            routed_out = self._forward_routed(x, indices, scores)
 
-        return shared_out + routed_out
-
-    def sync_fp8_weights(self):
-        """Sync FP8 shadow copies after optimizer step."""
-        for expert in self.routed_experts:
-            expert.sync_fp8()
+        # Sanitize: if expert ffn or router produced NaN from fp16 overflow,
+        # zero them to prevent cascading NaN through the residual stream.
+        if self.training and (torch.isnan(routed_out).any() or torch.isinf(routed_out).any()):
+            routed_out = torch.zeros_like(routed_out)
+        return shared_out + routed_out, aux_loss
 
     def maybe_update_router_bias(self):
         """Update router bias if it's time."""

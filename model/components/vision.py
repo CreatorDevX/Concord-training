@@ -12,7 +12,7 @@ from typing import Optional
 
 from model.config import ModelConfig
 from model.components.rms_norm import RMSNorm
-from model.components.delta_net import DeltaNet
+from model.components.delta_net import GatedDeltaNet
 
 
 class VisionConnector(nn.Module):
@@ -124,17 +124,19 @@ class TemporalVideoEncoder(nn.Module):
         self.in_norm = RMSNorm(config.d_model)
         
         # 2-layer temporal DeltaNet (no MoE)
-        self.temporal_delta1 = DeltaNet(
+        self.temporal_delta1 = GatedDeltaNet(
             d_model=config.d_model,
-            num_heads=config.delta_qk_heads,
+            n_v_heads=config.delta_v_heads,
+            n_qk_heads=config.delta_qk_heads,
             head_dim=config.delta_head_dim,
             chunk_size=config.delta_chunk_size,
         )
         self.delta_norm1 = RMSNorm(config.d_model)
         
-        self.temporal_delta2 = DeltaNet(
+        self.temporal_delta2 = GatedDeltaNet(
             d_model=config.d_model,
-            num_heads=config.delta_qk_heads,
+            n_v_heads=config.delta_v_heads,
+            n_qk_heads=config.delta_qk_heads,
             head_dim=config.delta_head_dim,
             chunk_size=config.delta_chunk_size,
         )
@@ -161,14 +163,10 @@ class TemporalVideoEncoder(nn.Module):
         x = self.in_norm(self.in_proj(x))
         
         # Temporal DeltaNet process
-        # Dummy partial states for inference/training setup
-        h1 = torch.zeros_like(x)
-        h2 = torch.zeros_like(x)
-        
-        out1, _, _ = self.temporal_delta1(x, [], h1)
+        out1, _ = self.temporal_delta1(x, None)
         out1 = self.delta_norm1(out1)
         
-        out2, _, _ = self.temporal_delta2(out1, [], h2)
+        out2, _ = self.temporal_delta2(out1, None)
         out2 = self.delta_norm2(out2)
         
         # Final salient token extraction

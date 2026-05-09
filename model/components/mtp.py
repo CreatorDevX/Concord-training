@@ -1,10 +1,14 @@
 """
-Multi-Token Prediction (MTP) Head.
+Multi-Token Prediction (MTP) Head — DeepSeek-style.
 
-Predicts token at t+1 and t+2 using hidden state at t.
-2-layer MLP per step, weight-tied to embedding matrix for final projection.
+Clean auxiliary loss heads: no embedding feedback, no autoregressive
+entanglement, no per-step MLP towers.
 
-L_total = L_main + mtp_weight × (L_mtp1 + L_mtp2)
+Design: shared projection + per-step lightweight residual adapters.
+    h_k = h + scale_k * SiLU(shared_proj(h)) + bias_k
+    loss_k = CE(lm_head(embed_down(h_k[:, :-k])), labels[:, k:])
+
+L_total = L_main + mtp_weight * sum(loss_k)
 """
 
 import torch
@@ -12,143 +16,135 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-from model.components.rms_norm import RMSNorm
-
 
 class MTPHead(nn.Module):
     """
-    Multi-Token Prediction head.
+    DeepSeek-style Multi-Token Prediction head.
 
-    For each step t, predicts tokens at t+1, t+2, ..., t+mtp_steps.
-    Each prediction uses a 2-layer MLP from hidden states +
-    the embedding of the previous prediction target.
+    Conditionally independent given hidden state — no recursive
+    token injection, no autoregressive entanglement.
 
     Args:
         d_model: model dimension
+        embed_dim: embedding dimension (for factorized projection)
         vocab_size: vocabulary size
         mtp_steps: number of future tokens to predict (default: 2)
-        tie_output: whether to tie output projections to embed_weight
+        tie_output: whether to tie output projection to embed_weight
         embed_weight: shared embedding weight (for tied projections)
     """
 
-    def __init__(
-        self,
-        d_model: int,
-        vocab_size: int,
-        mtp_steps: int = 2,
-        tie_output: bool = False,
-        embed_weight: Optional[nn.Parameter] = None,
-    ):
+    def __init__(self, d_model: int, embed_dim: int, vocab_size: int,
+                 mtp_steps: int = 2, tie_output: bool = True, embed_weight=None):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.mtp_steps = mtp_steps
         self.tie_output = tie_output
 
-        # Per-step prediction MLPs
-        self.prediction_heads = nn.ModuleList()
-        for _ in range(mtp_steps):
-            self.prediction_heads.append(nn.Sequential(
-                RMSNorm(d_model * 2),
-                nn.Linear(d_model * 2, d_model, bias=False),
-                nn.SiLU(),
-                RMSNorm(d_model),
-                nn.Linear(d_model, d_model, bias=False),
-            ))
+        # Shared transform — single projection, not per-step MLP towers
+        self.shared_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Per-step output projections — NOT tied to embedding if tie_output=False.
-        # If tied, we project using either a single tied linear or directly with F.linear.
-        self.output_projs = None
-        if not tie_output:
-            self.output_projs = nn.ModuleList()
-            for _ in range(mtp_steps):
-                proj = nn.Linear(d_model, vocab_size, bias=False)
-                self.output_projs.append(proj)
-        else:
-            self.output_proj = nn.Linear(d_model, vocab_size, bias=False)
+        # Per-step lightweight residual adapters (scale + bias)
+        self.step_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(d_model) * 0.1)
+            for _ in range(mtp_steps)
+        ])
+        self.step_biases = nn.ParameterList([
+            nn.Parameter(torch.zeros(d_model))
+            for _ in range(mtp_steps)
+        ])
+
+        # Output projection (tied to embedding)
+        if tie_output:
+            self.output_proj = nn.Linear(embed_dim, vocab_size, bias=False)
             if embed_weight is not None:
                 self.output_proj.weight = embed_weight
-
-        # Embedding projection for feeding back targets during training
-        self.embed_proj = nn.Linear(d_model, d_model, bias=False)
 
         # Stats
         self._last_losses = []
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        labels: torch.Tensor,
-        embed_weight: Optional[torch.Tensor] = None,
-        loss_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, labels, loss_mask=None, embed_down=None):
         """
-        Compute MTP loss.
+        Compute MTP loss — clean multi-shift supervision.
 
         Args:
-            hidden_states: (B, T, d_model) — final hidden states from the model
-            labels: (B, T) — target token IDs (standard next-token labels)
-            embed_weight: (vocab_size, d_model) — embedding table for lookup
+            hidden_states: (B, T, d_model) — final hidden states
+            labels: (B, T) — target token IDs
             loss_mask: (B, T) — optional mask for selective loss
+            embed_down: Linear(d_model, embed_dim) — factorized projection
 
         Returns:
             total MTP loss (scalar)
         """
         B, T, d = hidden_states.shape
-        total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
         self._last_losses = []
 
-        for step in range(self.mtp_steps):
-            # Target: labels shifted by (step + 1) positions
-            # For step=0: predict t+2 (main head predicts t+1)
-            # For step=1: predict t+3
-            shift = step + 1
+        # Shared transform (computed once, reused across all steps)
+        h_shared = F.silu(self.shared_proj(hidden_states))  # (B, T, d)
+
+        for k in range(self.mtp_steps):
+            shift = k + 1
             if shift >= T:
                 break
 
-            # Hidden states for positions that have valid targets
-            h = hidden_states[:, :T - shift, :]  # (B, T-shift, d)
+            # Per-step residual refinement — NOT a full MLP tower
+            h_k = hidden_states + self.step_scales[k] * h_shared + self.step_biases[k]
 
-            # Get embeddings of the label at position t+step (the previous MTP target)
-            # For step 0: embed labels at t+0 (the current target)
-            if embed_weight is not None:
-                prev_target_ids = labels[:, step:T - shift + step]  # (B, T-shift)
-                prev_target_embed = F.embedding(prev_target_ids, embed_weight)  # (B, T-shift, d)
-            else:
-                prev_target_embed = torch.zeros_like(h)
+            # Slice: predict tokens at t+shift from hidden states at t
+            pred_h = h_k[:, :-shift, :]       # (B, T-shift, d)
+            target = labels[:, shift:]          # (B, T-shift)
 
-            # Concatenate hidden state + previous target embedding
-            mlp_input = torch.cat([h, self.embed_proj(prev_target_embed)], dim=-1)  # (B, T-shift, 2d)
-
-            # Predict
-            pred_hidden = self.prediction_heads[step](mlp_input)  # (B, T-shift, d)
-            if self.tie_output:
-                logits = F.linear(pred_hidden, self.output_proj.weight)
-            else:
-                logits = self.output_projs[step](pred_hidden)           # (B, T-shift, vocab)
-
-            # Target labels for this step
-            target = labels[:, shift:T]  # (B, T-shift)
-
-            # Handle length mismatch
-            min_len = min(logits.shape[1], target.shape[1])
-            logits = logits[:, :min_len, :]
+            # Length alignment
+            min_len = min(pred_h.shape[1], target.shape[1])
+            pred_h = pred_h[:, :min_len, :]
             target = target[:, :min_len]
 
-            # Compute loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, self.vocab_size),
-                target.reshape(-1),
-                reduction="none",
-            ).view(B, min_len)
-
-            # Apply loss mask if provided
+            # Selective loss masking
             if loss_mask is not None:
                 mask = loss_mask[:, shift:shift + min_len]
-                loss = (loss * mask).sum() / (mask.sum() + 1e-10)
+                active_mask = (mask == 1).view(-1)
             else:
-                loss = loss.mean()
+                active_mask = torch.ones(B * min_len, dtype=torch.bool, device=hidden_states.device)
 
+            pred_flat = pred_h.reshape(B * min_len, -1)[active_mask]
+            target_flat = target.reshape(-1)[active_mask]
+
+            if pred_flat.shape[0] == 0:
+                continue
+
+            # Chunked cross-entropy to control peak memory (128 × 262k × 4B ≈ 134MB)
+            chunk_size = 128
+            step_loss = 0.0
+            total_tokens = pred_flat.shape[0]
+
+            for chunk_start in range(0, total_tokens, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_tokens)
+                h_chunk = pred_flat[chunk_start:chunk_end]
+                y_chunk = target_flat[chunk_start:chunk_end]
+
+                def compute_chunk_loss(xc, yc):
+                    if embed_down is not None:
+                        xc = embed_down(xc)
+                    if self.tie_output:
+                        logits_chunk = F.linear(xc, self.output_proj.weight)
+                    else:
+                        logits_chunk = self.output_proj(xc)
+                    logits_chunk = logits_chunk.float()
+                    logits_chunk = logits_chunk.clamp(min=-65504.0, max=65504.0)
+                    logits_chunk = torch.nan_to_num(logits_chunk, nan=0.0)
+                    return F.cross_entropy(logits_chunk, yc, reduction="sum", ignore_index=-100)
+                
+                if h_chunk.requires_grad:
+                    loss_chunk = torch.utils.checkpoint.checkpoint(
+                        compute_chunk_loss, h_chunk, y_chunk, use_reentrant=False
+                    )
+                else:
+                    loss_chunk = compute_chunk_loss(h_chunk, y_chunk)
+
+                step_loss = step_loss + loss_chunk
+
+            loss = step_loss / total_tokens
             self._last_losses.append(loss.item())
             total_loss = total_loss + loss
 

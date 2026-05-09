@@ -35,7 +35,10 @@ class DeltaBlock(nn.Module):
                  shared_moe: Optional[MoEBlock] = None):
         super().__init__()
         self.layer_idx = layer_idx
-        self.attn_res = attn_res
+        # Store attn_res as a plain reference — NOT as a submodule.
+        # attn_res is shared across all blocks; if registered as a child,
+        # block.to(device) would move it, breaking pipeline-parallel splits.
+        object.__setattr__(self, '_attn_res', attn_res)
 
         # Pre-norms
         self.norm1 = RMSNorm(config.d_model)
@@ -48,6 +51,7 @@ class DeltaBlock(nn.Module):
             n_qk_heads=config.delta_qk_heads,
             head_dim=config.delta_head_dim,
             chunk_size=config.delta_chunk_size,
+            use_checkpoint=not config.grad_checkpoint,
         )
 
         # Sublayer 2: MoE — shared across group or owned
@@ -64,6 +68,7 @@ class DeltaBlock(nn.Module):
                 router_hidden=config.router_hidden,
                 router_bias_update_interval=config.router_bias_update_interval,
                 expert_dtype=config.expert_dtype,
+                use_activation_recomputation=not config.grad_checkpoint,
             )
             self._owns_moe = True
 
@@ -73,7 +78,7 @@ class DeltaBlock(nn.Module):
         block_reprs: List[torch.Tensor],
         partial_residual: torch.Tensor,
         delta_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, T, d_model) — input (unused in AttnRes formulation, kept for interface)
@@ -85,20 +90,36 @@ class DeltaBlock(nn.Module):
             x: (B, T, d_model) — output
             partial_residual: (B, T, d_model) — updated partial residual
             delta_state: updated recurrent state
+            aux_loss: MoE auxiliary load balancing loss
         """
-        # AttnRes → DeltaNet sublayer
-        x_res = self.attn_res(self.layer_idx, block_reprs, partial_residual)
+        # AttnRes → DeltaNet sublayer (residual: input + attn_res + sublayer)
+        x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
         delta_out, delta_state = self.delta_net(self.norm1(x_res))
-        x = x_res + delta_out
+        x = x + x_res + delta_out
         partial_residual = partial_residual + x
+
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            partial_residual = torch.where(
+                torch.isnan(partial_residual) | torch.isinf(partial_residual),
+                torch.zeros_like(partial_residual),
+                partial_residual
+            )
 
         # AttnRes → MoE sublayer
-        x_res2 = self.attn_res(self.layer_idx, block_reprs, partial_residual)
-        moe_out = self.moe(self.norm2(x_res2))
-        x = x_res2 + moe_out
+        x_res2 = self._attn_res(self.layer_idx, block_reprs, partial_residual)
+        moe_out, aux_loss = self.moe(self.norm2(x_res2))
+        x = x + x_res2 + moe_out
         partial_residual = partial_residual + x
 
-        return x, partial_residual, delta_state
+        if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
+            x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
+            partial_residual = torch.where(
+                torch.isnan(partial_residual) | torch.isinf(partial_residual),
+                torch.zeros_like(partial_residual),
+                partial_residual
+            )
+
+        return x, partial_residual, delta_state, aux_loss
 
     def stats(self) -> dict:
         return {

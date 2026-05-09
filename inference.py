@@ -75,7 +75,7 @@ def main():
     
     # Reload model dynamically using identical saved hyperparameters dict
     config_dict = state.get("config", {})
-    model_config = ModelConfig(**config_dict)
+    model_config = ModelConfig.from_dict(config_dict)
     
     print("Building model architecture...")
     model = HybridMoE(model_config)

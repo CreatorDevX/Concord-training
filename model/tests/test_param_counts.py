@@ -32,9 +32,9 @@ class TestParamCounts:
     def test_full_scale_active_params(self):
         """Gate 2: Active params — check range."""
         counts = count_params(ModelConfig())
-        active = counts["active"]
-        active_m = active / 1e6
-        print(f"  Active: {active_m:.1f}M")
+        active_moe = counts["active_moe"]
+        active_m = active_moe / 1e6
+        print(f"  Active (MoE budget): {active_m:.1f}M")
 
     def test_expert_params_dominate(self):
         """Expert params should be majority of total."""
@@ -54,12 +54,12 @@ class TestParamCounts:
     def test_sharing_reduces_experts(self):
         """share_experts_within_group=True should reduce expert count."""
         import dataclasses
-        cfg_shared = ModelConfig()  # default is True
-        cfg_unshared = dataclasses.replace(cfg_shared, share_experts_within_group=False)
+        cfg_shared = dataclasses.replace(ModelConfig(), share_experts_within_group=True)
+        cfg_unshared = ModelConfig()  # default is False
 
         counts_shared = count_params(cfg_shared)
         counts_unshared = count_params(cfg_unshared)
 
         assert counts_shared["routed_experts"] < counts_unshared["routed_experts"]
-        assert counts_shared["n_unique_expert_sets"] == cfg_shared.n_groups
-        assert counts_unshared["n_unique_expert_sets"] == cfg_unshared.n_layers
+        assert counts_shared["n_expert_sets"] == cfg_shared.n_groups
+        assert counts_unshared["n_expert_sets"] == cfg_unshared.n_layers

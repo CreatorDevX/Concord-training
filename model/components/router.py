@@ -1,5 +1,7 @@
 """
-MLP Router — 2-layer MLP with bias-based load balancing.
+MLP Router — 2-layer MLP with dual load balancing:
+    1. Differentiable auxiliary loss (primary) — prevents early expert collapse
+    2. Bias-based drift correction (secondary) — fine-grained late-training correction
 
 Architecture:
     h = rms_norm(x)
@@ -9,9 +11,11 @@ Architecture:
     scores = softmax(logits)
     top_k_indices = topk(scores, k=n_routed)
 
-Load balancing: bias vector updated every `update_interval` steps:
-    bias += lr_bias * (actual_load - target_load)
-No auxiliary loss.
+Auxiliary Loss (Switch Transformer style):
+    L_aux = α * n_experts * Σ_e (f_e * P_e)
+    where f_e = fraction of tokens routed to expert e
+          P_e = mean router probability for expert e
+    This is differentiable and prevents expert collapse in early training.
 """
 
 import torch
@@ -24,7 +28,7 @@ from model.components.rms_norm import RMSNorm
 
 class MLPRouter(nn.Module):
     """
-    2-layer MLP router with bias-based load balancing.
+    2-layer MLP router with auxiliary load balancing loss + bias correction.
 
     Args:
         d_model: input dimension
@@ -33,6 +37,7 @@ class MLPRouter(nn.Module):
         hidden_dim: hidden dimension of MLP
         bias_update_interval: steps between bias updates
         bias_lr: learning rate for bias updates
+        aux_loss_coeff: coefficient for auxiliary load balancing loss
     """
 
     def __init__(
@@ -43,6 +48,7 @@ class MLPRouter(nn.Module):
         hidden_dim: int = 384,
         bias_update_interval: int = 1000,
         bias_lr: float = 0.01,
+        aux_loss_coeff: float = 0.01,
     ):
         super().__init__()
         self.d_model = d_model
@@ -50,6 +56,7 @@ class MLPRouter(nn.Module):
         self.n_routed = n_routed
         self.bias_update_interval = bias_update_interval
         self.bias_lr = bias_lr
+        self.aux_loss_coeff = aux_loss_coeff
 
         # 2-layer MLP
         self.norm = RMSNorm(d_model)
@@ -66,8 +73,9 @@ class MLPRouter(nn.Module):
 
         # Stats
         self._last_load_distribution = None
+        self._last_aux_loss = 0.0
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Route tokens to experts.
 
@@ -77,6 +85,7 @@ class MLPRouter(nn.Module):
         Returns:
             indices: (B, T, n_routed) — expert indices
             scores: (B, T, n_routed) — softmax scores for selected experts
+            aux_loss: scalar — differentiable load balancing loss
         """
         B, T, _ = x.shape
 
@@ -97,19 +106,38 @@ class MLPRouter(nn.Module):
         # Re-normalize selected scores
         top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-10)
 
-        # Track load distribution for bias updates
+        # ── Auxiliary load balancing loss (differentiable) ──────────────
+        # Switch Transformer style: L_aux = α * n_experts * Σ_e (f_e * P_e)
+        # f_e: fraction of tokens dispatched to expert e (from hard routing)
+        # P_e: mean router probability for expert e (from soft scores — differentiable)
+        # Must be fp32 — fp16 can underflow on the product sum
+        aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         if self.training:
             with torch.no_grad():
-                # Count how many tokens go to each expert
-                one_hot = F.one_hot(top_indices, self.n_experts).float()  # (B,T,n_routed,n_experts)
-                load = one_hot.sum(dim=(0, 1, 2))  # (n_experts,)
-                self.expert_load_acc += load
-                self.token_count_acc += B * T * self.n_routed
+                # f_e: fraction of tokens routed to each expert (non-differentiable)
+                one_hot = F.one_hot(top_indices, self.n_experts).float()
+                tokens_per_expert = one_hot.sum(dim=(0, 1, 2))
+                total_tokens = B * T * self.n_routed
+                f_e = tokens_per_expert / total_tokens
+
+                # Load tracking for bias updates
+                self.expert_load_acc += tokens_per_expert
+                self.token_count_acc += total_tokens
                 self.step_counter += 1
+                self._last_load_distribution = f_e
 
-                self._last_load_distribution = load / (B * T * self.n_routed)
+            # P_e: mean probability per expert (differentiable through scores)
+            P_e = scores.mean(dim=(0, 1))
 
-        return top_indices, top_scores
+            aux_loss = self.aux_loss_coeff * self.n_experts * (f_e * P_e).sum()
+            # Sanitize: if router inputs contain NaN (from upstream fp16 overflow),
+            # P_e will be NaN and aux_loss will be NaN. We zero it to prevent
+            # the entire total_loss from becoming NaN.
+            if torch.isnan(aux_loss).any() or torch.isinf(aux_loss).any():
+                aux_loss = torch.zeros_like(aux_loss)
+            self._last_aux_loss = aux_loss.item()
+
+        return top_indices, top_scores, aux_loss
 
     def update_bias(self):
         """
@@ -143,6 +171,7 @@ class MLPRouter(nn.Module):
             "bias_min": self.expert_bias.min().item(),
             "bias_max": self.expert_bias.max().item(),
             "step_counter": self.step_counter.item(),
+            "aux_loss": self._last_aux_loss,
         }
         if self._last_load_distribution is not None:
             load = self._last_load_distribution

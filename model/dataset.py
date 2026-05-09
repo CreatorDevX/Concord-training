@@ -215,8 +215,8 @@ class JsonlParquetDataset(IterableDataset):
     def _read_parquet(self, filepath: str):
         if pq is None:
             raise ImportError("pyarrow is required for parquet support")
-        table = pq.read_table(filepath) # load into memory chunks if possible or iterate
-        for batch in table.to_batches():
+        parquet_file = pq.ParquetFile(filepath)
+        for batch in parquet_file.iter_batches():
             for row in batch.to_pylist():
                 text = row.get(self.text_key, "")
                 if text: yield text
@@ -271,17 +271,64 @@ class HuggingFaceDataset(IterableDataset):
         # We load dataset via stream architecture
         dataset = load_dataset(self.dataset_path, split=self.split, streaming=True)
         
-        worker_info = get_worker_info()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        try:
+            import torch_xla.core.xla_model as xm
+            in_tpu = True
+        except ImportError:
+            in_tpu = False
+            
+        if in_tpu and xm.xrt_world_size() > 1:
+            rank = xm.get_ordinal()
+            world_size = xm.xrt_world_size()
+        else:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
         
+        worker_info = get_worker_info()
         num_workers = worker_info.num_workers if worker_info else 1
         worker_id = worker_info.id if worker_info else 0
         
         global_worker_id = rank * num_workers + worker_id
         global_num_workers = world_size * num_workers
         
-        for i, example in enumerate(dataset):
+        
+        import time
+        import logging
+        from itertools import islice
+
+        def resilient_stream(dataset, start_idx=0, max_retries=100):
+            """Wraps the dataset iterator with robust reconnection logic to prevent hanging."""
+            current_idx = start_idx
+            retries = 0
+            
+            while retries < max_retries:
+                try:
+                    # Skip to the current index using itertools.islice
+                    iterator = iter(dataset)
+                    if current_idx > 0:
+                        iterator = islice(iterator, current_idx, None)
+                        
+                    for item in iterator:
+                        yield current_idx, item
+                        current_idx += 1
+                        retries = 0  # Reset retries on successful yield
+                        
+                    break  # If we exhausted the dataset normally, we're done
+                    
+                except Exception as e:
+                    retries += 1
+                    err_msg = str(e).lower()
+                    if "timeout" in err_msg or "connection" in err_msg or "ssl" in err_msg or "http" in err_msg:
+                        logging.warning(f"HF Dataset network error at index {current_idx}: {e}. Retrying {retries}/{max_retries} in 15 seconds...")
+                        time.sleep(15)
+                    else:
+                        logging.error(f"HF Dataset unexpected error at index {current_idx}: {e}.")
+                        # For format/parsing errors, we want to skip the bad item and continue
+                        current_idx += 1 
+                        time.sleep(2)
+        
+        # Use the resilient stream to iterate
+        for i, example in resilient_stream(dataset):
             # Deterministic modulo splitting ensures zero duplicate drops when distributed over multi-GPU environments!
             if i % global_num_workers != global_worker_id:
                 continue
@@ -289,14 +336,19 @@ class HuggingFaceDataset(IterableDataset):
             text = example.get(self.text_key, "")
             if not text: continue
             
-            pct = self.progress_tracker.get_percentage()
-            input_ids, loss_mask = self.formatter.format(text, pct)
-            self.progress_tracker.add_tokens(len(input_ids))
-            
-            yield {
-                "input_ids": input_ids,
-                "loss_mask": loss_mask,
-            }
+            try:
+                pct = self.progress_tracker.get_percentage()
+                input_ids, loss_mask = self.formatter.format(text, pct)
+                self.progress_tracker.add_tokens(len(input_ids))
+                
+                yield {
+                    "input_ids": input_ids,
+                    "loss_mask": loss_mask,
+                }
+            except Exception as e:
+                # Catch any formatting errors to prevent the entire dataloader from dying
+                logging.warning(f"Error formatting example {i}: {e}. Skipping.")
+                continue
 
 
 class MultimodalDataset(IterableDataset):

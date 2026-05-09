@@ -16,26 +16,33 @@ from typing import Optional
 @dataclass
 class ModelConfig:
     # ── Dimensions ──────────────────────────────────────────────────────
-    d_model: int = 1024
+    d_model: int = 768
     vocab_size: int = 262189  # updated with the custom tokenizer
+    embed_dim: int = 384
 
     # ── Layers ──────────────────────────────────────────────────────────
-    n_layers: int = 24
+    n_layers: int = 16
     group_size: int = 4           # 3 DeltaNet + 1 Attention per group
-    n_groups: int = 6             # 6 × 4 = 24 layers
+    n_groups: int = 4             # 4 × 4 = 16 layers
 
     # ── DeltaNet ────────────────────────────────────────────────────────
-    # d_qk = d_v = 16 × 64 = 1024 = d_model
-    delta_v_heads: int = 16
-    delta_qk_heads: int = 16
+    # d_qk = d_v = 12 × 64 = 768 = d_model
+    delta_v_heads: int = 12
+    delta_qk_heads: int = 12
     delta_head_dim: int = 64
 
     # ── Full Attention ──────────────────────────────────────────────────
-    # d_q = 8 × 128 = 1024 = d_model  |  d_kv = 2 × 128 = 256
-    attn_q_heads: int = 8
+    # d_q = 6 × 128 = 768 = d_model  |  d_kv = 2 × 128 = 256
+    attn_q_heads: int = 6
     attn_kv_heads: int = 2
     attn_head_dim: int = 128
-    rope_dim: int = 64            # partial RoPE on first 64 of 128 dims
+    
+    # ── AgentRoPE (4-axis Temporal Multimodal RoPE) ─────────────────────
+    # Sum must be equal to attn_head_dim (128)
+    rope_axis_dims: dict = field(default_factory=lambda: {
+        "x": 16, "y": 16, "u": 32, "w": 64
+    })
+    rope_dim: int = 128            # Using all dims for various RoPE axes
 
     # ── Attention types ─────────────────────────────────────────────────
     csa_top_k: int = 1024
@@ -44,14 +51,13 @@ class ModelConfig:
     hca_compress: int = 128
 
     # ── MoE ─────────────────────────────────────────────────────────────
-    # Solved: 80 experts × 24 layers × 1,081,344 per expert = 2.08B routed
-    # Active: (18×2 + 6×4) = 60 invocations × 1.08M/expert = 64.9M
-    #       + 24 shared × 1.08M = 25.9M  +  router/attnres ~12M  ≈ 103M
-    n_experts: int = 96
+    # Target: ~500M total parameters, strictly <30M active (routed + shared).
+    n_experts: int = 36
     n_routed_delta: int = 2       # active routed experts per DeltaNet layer
-    n_routed_attn: int = 4        # active routed experts per Attention layer
+    n_routed_attn: int = 2        # active routed experts per Attention layer
     n_shared: int = 1
-    expert_intermediate: int = 384  # SwiGLU: 3 × 1024 × 352 = 1.08M per expert
+    expert_intermediate: int = 256  # SwiGLU: 3 × 768 × 256 = ~589K per expert
+    aux_loss_coeff: float = 0.01
 
     # ── Router ──────────────────────────────────────────────────────────
     router_hidden: int = 256
@@ -66,10 +72,9 @@ class ModelConfig:
     mtp_tie_output: bool = True  # per-step output projections (untied)
 
     # ── Memory optimizations ────────────────────────────────────────────
-    expert_dtype: str = "fp8"     # fp8 storage, bf16 compute
+    expert_dtype: str = "fp16"     # Use native fp16 execution
     use_expert_sgd: bool = True   # SGD for experts, Muon for rest
     grad_checkpoint: bool = True
-    grad_offload_cpu: bool = True
     share_experts_within_group: bool = False
 
     # ── Training ────────────────────────────────────────────────────────
@@ -81,6 +86,7 @@ class ModelConfig:
     selective_loss: bool = True
     jinja_template_path: Optional[str] = None
     corpus_tokens: int = 2048
+    use_vision: bool = True       # Master flag to enable/disable vision execution
     vision_weights_path: Optional[str] = None
 
     # ── DeltaNet chunk size for parallel scan ───────────────────────────

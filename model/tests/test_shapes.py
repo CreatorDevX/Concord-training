@@ -122,14 +122,20 @@ class TestGatedAttention:
             n_q_heads=config.attn_q_heads,
             n_kv_heads=config.attn_kv_heads,
             head_dim=config.attn_head_dim,
-            rope_dim=config.rope_dim,
+            rope_axis_dims=config.rope_axis_dims,
             variant="csa",
             csa_compress=config.csa_compress,
             csa_top_k=config.csa_top_k,
             csa_window=config.csa_window,
         ).to(device)
         x = torch.randn(1, 32, config.d_model, device=device)
-        out = attn(x)
+        coords = {
+            "x": torch.zeros(1, 32, device=device),
+            "y": torch.zeros(1, 32, device=device),
+            "u": torch.arange(32, device=device).unsqueeze(0).float(),
+            "w": torch.zeros(1, 32, device=device),
+        }
+        out = attn(x, coords=coords)
         assert out.shape == (1, 32, config.d_model)
 
     def test_hca_shape(self, config, device):
@@ -138,12 +144,18 @@ class TestGatedAttention:
             n_q_heads=config.attn_q_heads,
             n_kv_heads=config.attn_kv_heads,
             head_dim=config.attn_head_dim,
-            rope_dim=config.rope_dim,
+            rope_axis_dims=config.rope_axis_dims,
             variant="hca",
             hca_compress=config.hca_compress,
         ).to(device)
         x = torch.randn(1, 128, config.d_model, device=device)
-        out = attn(x)
+        coords = {
+            "x": torch.zeros(1, 128, device=device),
+            "y": torch.zeros(1, 128, device=device),
+            "u": torch.arange(128, device=device).unsqueeze(0).float(),
+            "w": torch.zeros(1, 128, device=device),
+        }
+        out = attn(x, coords=coords)
         assert out.shape == (1, 128, config.d_model)
 
 
@@ -167,7 +179,7 @@ class TestBlockAttnRes:
 class TestExpertFFN:
     def test_shape(self, config, device):
         expert = ExpertFFN(
-            d_model=config.d_model, d_ffn=config.expert_intermediate, dtype="bf16"
+            d_model=config.d_model, d_ffn=config.expert_intermediate
         ).to(device)
         x = torch.randn(32, config.d_model, device=device)
         out = expert(x)
@@ -175,7 +187,7 @@ class TestExpertFFN:
 
     def test_params(self, config, device):
         expert = ExpertFFN(
-            d_model=config.d_model, d_ffn=config.expert_intermediate, dtype="bf16"
+            d_model=config.d_model, d_ffn=config.expert_intermediate
         ).to(device)
         params = sum(p.numel() for p in expert.parameters())
         expected = 3 * config.d_model * config.expert_intermediate
@@ -189,9 +201,10 @@ class TestMLPRouter:
             n_routed=config.n_routed_delta, hidden_dim=config.router_hidden
         ).to(device)
         x = torch.randn(1, 16, config.d_model, device=device)
-        indices, scores = router(x)
+        indices, scores, aux_loss = router(x)
         assert indices.shape == (1, 16, config.n_routed_delta)
         assert scores.shape == (1, 16, config.n_routed_delta)
+        assert aux_loss.dim() == 0
 
     def test_scores_sum_to_one(self, config, device):
         router = MLPRouter(
@@ -199,7 +212,7 @@ class TestMLPRouter:
             n_routed=config.n_routed_delta, hidden_dim=config.router_hidden
         ).to(device)
         x = torch.randn(1, 16, config.d_model, device=device)
-        _, scores = router(x)
+        _, scores, _ = router(x)
         sums = scores.sum(dim=-1)
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
 
@@ -214,18 +227,20 @@ class TestMoEBlock:
             expert_dtype=config.expert_dtype,
         ).to(device)
         x = torch.randn(1, 8, config.d_model, device=device)
-        out = moe(x)
+        out, aux_loss = moe(x)
         assert out.shape == (1, 8, config.d_model)
+        assert aux_loss.dim() == 0
 
 
 class TestMTPHead:
     def test_shape_and_loss(self, config, device):
         mtp = MTPHead(
-            d_model=config.d_model, vocab_size=config.vocab_size, mtp_steps=config.mtp_steps
+            d_model=config.d_model, embed_dim=config.embed_dim,
+            vocab_size=config.vocab_size, mtp_steps=config.mtp_steps
         ).to(device)
         hidden = torch.randn(1, 32, config.d_model, device=device)
         labels = torch.randint(0, config.vocab_size, (1, 32), device=device)
-        embed_weight = torch.randn(config.vocab_size, config.d_model, device=device)
-        loss = mtp(hidden, labels, embed_weight)
+        embed_down = torch.nn.Linear(config.d_model, config.embed_dim, bias=False).to(device)
+        loss = mtp(hidden, labels, embed_down=embed_down)
         assert loss.dim() == 0
         assert loss.item() > 0

@@ -1,5 +1,5 @@
 """
-Gated Attention — CSA and HCA Variants.
+Gated Attention — CSA and HCA Variants with Causal Compression.
 
 Base: GQA with 8 Q heads, 2 KV heads, head_dim=256, partial RoPE,
 output gating via sigmoid(W_gate @ x), Flash Attention 2 / SDPA backend.
@@ -10,6 +10,13 @@ CSA (Compressed Sparse Attention) — even-indexed attention layers:
 
 HCA (Hierarchical Compressed Attention) — odd-indexed attention layers:
     Compress KV at 128×, dense attention over compressed sequence.
+
+FIXES:
+    - KVCompressor now applies CAUSAL masking: compressed block j only
+      summarizes tokens [j*r, ..., (j+1)*r - 1], and queries at position t
+      can only attend to blocks where (j+1)*r - 1 <= t (fully past).
+    - CSA fallback (short sequences) now applies proper causal+window mask.
+    - Temporal decay bias integrated for wallclock-aware attention.
 """
 
 import torch
@@ -19,11 +26,11 @@ import math
 from typing import Optional, Tuple, Dict
 
 from model.components.rms_norm import RMSNorm
-from model.components.rope import PartialRoPE
+from model.components.rope import PartialRoPE, TemporalDecayBias
 
 
 class KVCompressor(nn.Module):
-    """Compresses KV pairs by pooling along the sequence dimension."""
+    """Compresses KV pairs by pooling along the sequence dimension (causal-aware)."""
 
     def __init__(self, compress_ratio: int, d_kv: int):
         super().__init__()
@@ -33,27 +40,34 @@ class KVCompressor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Causal compression: each compressed slot j summarizes tokens
+        [j*r, ..., (j+1)*r - 1]. We only compress COMPLETE groups.
+        Incomplete trailing tokens are discarded (handled by the local
+        window in CSA, or are negligible for HCA's high compression).
+
         Args:
             x: (B, n_kv_heads, T, head_dim)
         Returns:
-            (B, n_kv_heads, T // compress_ratio, head_dim)
+            (B, n_kv_heads, T_comp, head_dim) where T_comp = T // compress_ratio
         """
         B, H, T, D = x.shape
         r = self.compress_ratio
 
-        # Pad sequence to be divisible by compress_ratio
-        pad_len = (r - T % r) % r
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len))
-            T_padded = T + pad_len
-        else:
-            T_padded = T
+        # Only compress complete groups — drop trailing tokens
+        # This ensures each compressed slot is fully causal:
+        # slot j summarizes exactly [j*r, ..., (j+1)*r - 1], all past.
+        n_complete = T // r
+        if n_complete == 0:
+            # Sequence too short to compress at all — return empty
+            return x.new_zeros(B, H, 0, D)
+
+        usable_len = n_complete * r
+        x_usable = x[:, :, :usable_len, :]
 
         # Reshape: group consecutive tokens
-        n_compressed = T_padded // r
-        x = x.view(B, H, n_compressed, r * D)  # (B, H, T//r, r*D)
-        x = self.compress_proj(x)                # (B, H, T//r, D)
-        return x
+        x_grouped = x_usable.reshape(B, H, n_complete, r * D)  # (B, H, T_comp, r*D)
+        compressed = self.compress_proj(x_grouped)               # (B, H, T_comp, D)
+        return compressed
 
 
 class GatedAttention(nn.Module):
@@ -80,13 +94,13 @@ class GatedAttention(nn.Module):
         n_q_heads: int,
         n_kv_heads: int,
         head_dim: int,
-        rope_dim: int = 64,
-        max_seq_len: int = 8192,
+        rope_axis_dims: Dict[str, int],
         variant: str = "csa",
         csa_top_k: int = 1024,
         csa_window: int = 128,
         csa_compress: int = 4,
         hca_compress: int = 128,
+        use_checkpoint: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -109,20 +123,31 @@ class GatedAttention(nn.Module):
         # Output gating
         self.gate_proj = nn.Linear(d_model, n_q_heads * head_dim, bias=False)
 
-        # Partial RoPE
-        self.rope = PartialRoPE(head_dim, rope_dim, max_seq_len)
+        # AgentRoPE (Temporal Multimodal RoPE)
+        from model.components.rope import TemporalMultimodalRoPE
+        self.rope = TemporalMultimodalRoPE(
+            axis_dims=rope_axis_dims,
+            wallclock_scale_seconds=60.0,
+            use_log_wallclock=True,
+        )
+
+        # Temporal decay bias for wallclock-aware attention
+        self.temporal_bias = TemporalDecayBias(n_q_heads, n_buckets=32)
 
         # KV compression
         d_kv = head_dim
         if variant == "csa":
             self.kv_compressor = KVCompressor(csa_compress, d_kv)
+            self.compress_ratio = csa_compress
         elif variant == "hca":
             self.kv_compressor = KVCompressor(hca_compress, d_kv)
+            self.compress_ratio = hca_compress
         else:
             raise ValueError(f"Unknown variant: {variant}")
 
         # Scale factor
         self.scale = 1.0 / math.sqrt(head_dim)
+        self.use_checkpoint = use_checkpoint
 
         # Stats
         self._last_attn_entropy = 0.0
@@ -135,6 +160,32 @@ class GatedAttention(nn.Module):
         x = x[:, :, None, :, :].expand(B, H, self.n_rep, T, D)
         return x.reshape(B, H * self.n_rep, T, D)
 
+    def _build_causal_compress_mask(
+        self, T_q: int, T_comp: int, compress_ratio: int, device: torch.device,
+        q_start: int = 0,
+    ) -> torch.Tensor:
+        """
+        Build causal mask for compressed attention.
+
+        Query at position i can attend to compressed block j
+        only if (j+1) * compress_ratio - 1 <= i, i.e., the ENTIRE
+        compressed block is in the past.
+
+        Args:
+            q_start: absolute position offset for chunked query processing.
+
+        Returns:
+            (T_q, T_comp) bool mask — True = allowed, False = masked
+        """
+        # The last original token in compressed block j is at (j+1)*r - 1
+        block_end_positions = (torch.arange(T_comp, device=device) + 1) * compress_ratio - 1
+        # Use absolute query positions when processing chunks
+        query_positions = torch.arange(T_q, device=device) + q_start
+
+        # query_positions (T_q, 1) >= block_end_positions (1, T_comp)
+        mask = query_positions.unsqueeze(1) >= block_end_positions.unsqueeze(0)
+        return mask
+
     def _csa_forward(
         self,
         q: torch.Tensor,
@@ -142,105 +193,247 @@ class GatedAttention(nn.Module):
         v: torch.Tensor,
         k_compressed: torch.Tensor,
         v_compressed: torch.Tensor,
+        w_q: Optional[torch.Tensor] = None,
+        w_k: Optional[torch.Tensor] = None,
+        q_start: int = 0,
     ) -> torch.Tensor:
         """
-        CSA: Compressed Sparse Attention.
-        At short seq_len (≤ csa_top_k after compression), degrades to full attention.
+        CSA: Compressed Sparse Attention with proper causal masking.
+
+        Args:
+            q_start: absolute position offset for chunked query processing.
+                     Used to correctly compute the local window mask when q is a subset.
         """
         B, H, T, D = q.shape
         T_comp = k_compressed.shape[2]
 
-        # If compressed length ≤ top_k, just do full attention on compressed
+        if T_comp == 0:
+            # No compressed keys — fall back to causal local attention
+            k_local = self._repeat_kv(k)
+            v_local = self._repeat_kv(v)
+            out = F.scaled_dot_product_attention(q, k_local, v_local, is_causal=True)
+            return out
+
+        # If compressed length <= top_k, use all compressed + local with proper mask
         if T_comp <= self.csa_top_k:
-            # Expand KV heads for GQA
             k_exp = self._repeat_kv(k_compressed)
             v_exp = self._repeat_kv(v_compressed)
-
-            # Also include local window from uncompressed
             k_local = self._repeat_kv(k)
             v_local = self._repeat_kv(v)
 
             # Concatenate compressed + local
-            k_cat = torch.cat([k_exp, k_local], dim=2)
+            k_cat = torch.cat([k_exp, k_local], dim=2)   # (B, H, T_comp+T_full, D)
             v_cat = torch.cat([v_exp, v_local], dim=2)
 
-            # Use SDPA with causal mask on local part
-            # For simplicity, use full attention here (CSA degrades at short ctx)
-            out = F.scaled_dot_product_attention(
-                q, k_cat, v_cat, is_causal=False,
-                attn_mask=self._build_csa_mask(T, k_cat.shape[2], q.device),
-            )
+            # Build combined mask: causal-compress for first T_comp cols, causal for last T_full cols
+            T_full = k.shape[2]
+            comp_mask = self._build_causal_compress_mask(T, T_comp, self.compress_ratio, q.device, q_start=q_start)
+            # Local mask uses absolute positions for correct window offset
+            i_idx = (torch.arange(T, device=q.device) + q_start).unsqueeze(1)
+            j_idx = torch.arange(T_full, device=q.device).unsqueeze(0)
+            local_mask = (i_idx >= j_idx) & (i_idx - j_idx < self.csa_window)
+            combined_mask = torch.cat([comp_mask, local_mask], dim=1)  # (T, T_comp+T_full)
+
+            # Expand mask for SDPA: (1, 1, T, T_comp + T_full)
+            attn_mask = combined_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+            float_mask = torch.where(attn_mask, torch.tensor(0.0, device=q.device, dtype=q.dtype),
+                                     torch.tensor(float('-inf'), device=q.device, dtype=q.dtype))
+
+            # Apply temporal bias if wallclock coords are available
+            if w_q is not None and w_k is not None:
+                w_k_comp = w_k[:, self.compress_ratio - 1 :: self.compress_ratio]
+                if w_k_comp.shape[1] < T_comp:
+                    pad_len = T_comp - w_k_comp.shape[1]
+                    w_k_comp = torch.cat([w_k_comp, w_k_comp[:, -1:].expand(-1, pad_len)], dim=1)
+                
+                w_k_cat = torch.cat([w_k_comp, w_k], dim=1)
+                bias = self.temporal_bias(w_q, w_k_cat)
+                float_mask = float_mask + bias
+
+            out = F.scaled_dot_product_attention(q, k_cat, v_cat, attn_mask=float_mask)
             return out
 
-        # Full CSA with top-k selection
+        # Full CSA with top-k selection + causal masking
         k_exp = self._repeat_kv(k_compressed)
         v_exp = self._repeat_kv(v_compressed)
 
-        # Score each query against all compressed keys
-        scores = torch.matmul(q, k_exp.transpose(-2, -1)) * self.scale  # (B,H,T,T_comp)
+        # Score each query against compressed keys
+        scores_comp = torch.matmul(q, k_exp.transpose(-2, -1)) * self.scale  # (B,H,T,T_comp)
 
-        # Top-k selection per query
+        # Apply causal mask to compressed scores
+        comp_causal_mask = self._build_causal_compress_mask(T, T_comp, self.compress_ratio, q.device, q_start=q_start)
+        scores_comp.masked_fill_(~comp_causal_mask.unsqueeze(0).unsqueeze(0), -float('inf'))
+
+        # Mask out non-top-k scores (among causally valid ones)
         top_k = min(self.csa_top_k, T_comp)
-        top_scores, top_idx = scores.topk(top_k, dim=-1)  # (B,H,T,top_k)
+        if top_k < T_comp:
+            sanitized = scores_comp.masked_fill(
+                scores_comp == float('-inf'), 
+                torch.finfo(scores_comp.dtype).min
+            )
+            threshold = sanitized.topk(top_k, dim=-1, largest=True).values[..., -1:]
+            scores_comp = scores_comp.masked_fill(scores_comp < threshold, -float('inf'))
 
-        # Gather selected KV
-        top_idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, D)  # (B,H,T,top_k,D)
-        k_selected = k_exp.unsqueeze(2).expand(-1, -1, T, -1, -1).gather(3, top_idx_exp)
-        v_selected = v_exp.unsqueeze(2).expand(-1, -1, T, -1, -1).gather(3, top_idx_exp)
-
-        # Local window keys/values
+        # Local window with causal masking (full KV for correct absolute positions)
+        T_full = k.shape[2]
         k_local = self._repeat_kv(k)
         v_local = self._repeat_kv(v)
+        scores_local = torch.matmul(q, k_local.transpose(-2, -1)) * self.scale  # (B,H,T,T_full)
 
-        # For each query position, get local window
-        # Simplified: just use the last `csa_window` positions (causal)
-        window = min(self.csa_window, T)
-        k_win = k_local[:, :, max(0, T - window):T, :]
-        v_win = v_local[:, :, max(0, T - window):T, :]
+        # Causal and window masking for local — absolute positions
+        i_idx = (torch.arange(T, device=q.device) + q_start).unsqueeze(1)
+        j_idx = torch.arange(T_full, device=q.device).unsqueeze(0)
+        mask_local = (i_idx >= j_idx) & (i_idx - j_idx < self.csa_window)
+        scores_local.masked_fill_(~mask_local, -float('inf'))
 
-        # Attend over selected compressed + local window
-        # Concatenate along the KV dimension
-        k_attend = torch.cat([k_selected.view(B, H, T, top_k, D).reshape(B * H * T, top_k, D),
-                              k_win.unsqueeze(2).expand(-1, -1, T, -1, -1).reshape(B * H * T, window, D)], dim=1)
-        v_attend = torch.cat([v_selected.view(B, H, T, top_k, D).reshape(B * H * T, top_k, D),
-                              v_win.unsqueeze(2).expand(-1, -1, T, -1, -1).reshape(B * H * T, window, D)], dim=1)
+        # Apply temporal bias to both compressed and local segments
+        if w_q is not None and w_k is not None:
+            w_k_comp = w_k[:, self.compress_ratio - 1 :: self.compress_ratio]
+            if w_k_comp.shape[1] < T_comp:
+                pad_len = T_comp - w_k_comp.shape[1]
+                w_k_comp = torch.cat([w_k_comp, w_k_comp[:, -1:].expand(-1, pad_len)], dim=1)
+            
+            bias_comp = self.temporal_bias(w_q, w_k_comp)
+            bias_local = self.temporal_bias(w_q, w_k)
+            
+            scores_comp = scores_comp + bias_comp
+            scores_local = scores_local + bias_local
 
-        q_flat = q.reshape(B * H * T, 1, D)
-        attn_weights = torch.matmul(q_flat, k_attend.transpose(-2, -1)) * self.scale
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        out = torch.matmul(attn_weights, v_attend)
-        return out.view(B, H, T, D)
+        # Concatenate and softmax properly
+        scores_all = torch.cat([scores_comp, scores_local], dim=-1)
+        attn_weights = F.softmax(scores_all, dim=-1)
+
+        attn_weights_comp = attn_weights[..., :T_comp]
+        attn_weights_local = attn_weights[..., T_comp:]
+
+        out = torch.matmul(attn_weights_comp, v_exp) + torch.matmul(attn_weights_local, v_local)
+        return out
 
     def _hca_forward(
         self,
         q: torch.Tensor,
         k_compressed: torch.Tensor,
         v_compressed: torch.Tensor,
+        w_q: Optional[torch.Tensor] = None,
+        w_k: Optional[torch.Tensor] = None,
+        q_start: int = 0,
     ) -> torch.Tensor:
-        """HCA: dense attention over heavily compressed KV sequence."""
+        """
+        HCA: dense attention over heavily compressed KV sequence
+        with causal masking on compressed blocks.
+        """
+        B, H, T, D = q.shape
+        T_comp = k_compressed.shape[2]
+
+        if T_comp == 0:
+            # Nothing to attend to — return zeros
+            return torch.zeros_like(q)
+
         k_exp = self._repeat_kv(k_compressed)
         v_exp = self._repeat_kv(v_compressed)
 
-        # Dense attention over compressed sequence — no causal mask needed
-        # because compression is applied to the full past context
-        out = F.scaled_dot_product_attention(q, k_exp, v_exp, is_causal=False)
+        # Build causal mask for compressed blocks
+        comp_causal_mask = self._build_causal_compress_mask(
+            T, T_comp, self.compress_ratio, q.device, q_start=q_start
+        )
+        # Expand: (1, 1, T, T_comp)
+        attn_mask = comp_causal_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+        float_mask = torch.where(attn_mask, torch.tensor(0.0, device=q.device, dtype=q.dtype),
+                                 torch.tensor(float('-inf'), device=q.device, dtype=q.dtype))
+
+        # Apply temporal bias if wallclock coords are available
+        if w_q is not None and w_k is not None:
+            bias = self.temporal_bias(w_q, w_k)
+            float_mask = float_mask + bias
+
+        out = F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=float_mask)
         return out
 
-    def _build_csa_mask(self, T_q: int, T_kv: int, device: torch.device) -> torch.Tensor:
-        """Build attention mask for CSA (allow all compressed + causal local)."""
-        mask = torch.zeros(T_q, T_kv, device=device, dtype=torch.bool)
-        # All positions can attend to all KV positions in this simplified version
-        return None  # No mask needed — we handle causality through the structure
+    def _compute_attention_with_gate(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor,
+        coords: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Full attention computation (RoPE + compress + attend + gate) wrapped
+        as a single function for activation recomputation checkpointing.
+
+        Queries are processed in chunks to avoid materializing giant
+        attention score matrices (the main source of OOM at long context).
+        """
+        B, T = q.shape[0], q.shape[2]
+
+        # Apply AgentRoPE (Temporal Multimodal RoPE)
+        q, k = self.rope(q, k, coords)
+
+        # Compress KV (causally safe)
+        k_compressed = self.kv_compressor(k)
+        v_compressed = self.kv_compressor(v)
+
+        # Extract wallclock coords if present
+        w_q = coords.get("w") if coords is not None else None
+        w_k = coords.get("w") if coords is not None else None
+
+        # Pre-process wallclock coords for HCA
+        w_k_hca = None
+        if self.variant == "hca" and w_k is not None:
+            w_k_hca = w_k[:, self.compress_ratio - 1 :: self.compress_ratio]
+            T_comp = k_compressed.shape[2]
+            if w_k_hca.shape[1] < T_comp:
+                pad_len = T_comp - w_k_hca.shape[1]
+                w_k_hca = torch.cat([w_k_hca, w_k_hca[:, -1:].expand(-1, pad_len)], dim=1)
+
+        # Full attention variant (no compression) — chunked for memory
+        if self.variant == "full":
+            attn_out = F.scaled_dot_product_attention(q, self._repeat_kv(k), self._repeat_kv(v), is_causal=True)
+            attn_out = gate * attn_out
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
+            return self.o_proj(attn_out)
+
+        # Chunk queries to bound peak attention score memory
+        # Each chunk processes T_queries × (T_comp + T_local) scores at a time
+        q_chunk_size = 256
+        output_chunks = []
+
+        for start in range(0, T, q_chunk_size):
+            end = min(start + q_chunk_size, T)
+            q_chunk = q[:, :, start:end, :]
+            gate_chunk = gate[:, :, start:end, :]
+
+            if self.variant == "csa":
+                w_q_chunk = w_q[:, start:end] if w_q is not None else None
+                out_chunk = self._csa_forward(
+                    q_chunk, k, v, k_compressed, v_compressed,
+                    w_q=w_q_chunk, w_k=w_k, q_start=start,
+                )
+            else:  # hca
+                out_chunk = self._hca_forward(
+                    q_chunk, k_compressed, v_compressed,
+                    w_q=w_q[:, start:end] if w_q is not None else None,
+                    w_k=w_k_hca, q_start=start,
+                )
+
+            out_chunk = gate_chunk * out_chunk
+            out_chunk = out_chunk.transpose(1, 2).contiguous().view(B, end - start, -1)
+            output_chunks.append(out_chunk)
+
+        output = torch.cat(output_chunks, dim=1)
+        return self.o_proj(output)
 
     def forward(
         self,
         x: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        coords: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Args:
             x: (B, T, d_model)
             position_ids: (B, T) optional
+            coords: optional dict of multimodal coordinates for AgentRoPE
 
         Returns:
             (B, T, d_model)
@@ -252,37 +445,26 @@ class GatedAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Apply partial RoPE
-        # Need to expand k for RoPE then contract back — or apply RoPE per-group
-        # RoPE expects same head count for q and k, so we expand k temporarily
-        k_for_rope = self._repeat_kv(k)
-        q, k_rotated = self.rope(q, k_for_rope, position_ids)
-        # Average back to kv_heads for efficiency
-        if self.n_rep > 1:
-            k = k_rotated.view(B, self.n_kv_heads, self.n_rep, T, self.head_dim).mean(dim=2)
-        else:
-            k = k_rotated
-
-        # Compress KV
-        k_compressed = self.kv_compressor(k)
-        v_compressed = self.kv_compressor(v)
-
         # Gate
         gate = torch.sigmoid(self.gate_proj(x))  # (B, T, n_q_heads * head_dim)
         gate = gate.view(B, T, self.n_q_heads, self.head_dim).transpose(1, 2)
 
-        # Attention variant
-        if self.variant == "csa":
-            attn_out = self._csa_forward(q, k, v, k_compressed, v_compressed)
-        else:  # hca
-            attn_out = self._hca_forward(q, k_compressed, v_compressed)
+        # Attention computation with optional activation recomputation
+        if self.training and self.use_checkpoint:
+            output = torch.utils.checkpoint.checkpoint(
+                self._compute_attention_with_gate, q, k, v, gate, coords,
+                use_reentrant=False,
+            )
+        else:
+            output = self._compute_attention_with_gate(q, k, v, gate, coords)
 
-        # Apply gate
-        attn_out = gate * attn_out
-
-        # Merge heads and project
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, -1)
-        output = self.o_proj(attn_out)
+        # Sanitize: attention matmuls can overflow fp16 in rare cases
+        if self.training and (output.dtype == torch.float16 or output.dtype == torch.bfloat16):
+            output = torch.where(
+                torch.isnan(output) | torch.isinf(output),
+                torch.zeros_like(output),
+                output
+            )
 
         return output
 

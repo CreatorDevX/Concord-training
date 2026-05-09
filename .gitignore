@@ -1,2 +1,6 @@
 #Yo can you please exempt .pyc files?
 *.pyc
+npm_modules/*
+job.txt
+bugs.txt
+finetuning/HF/saved/model.safetensors
