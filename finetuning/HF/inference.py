@@ -194,7 +194,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir, trust_remote_code=True)
 
     print(f"Loading model from {args.model_dir}...")
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
     from finetuning.HF import ConcordForCausalLM
 
     model = ConcordForCausalLM.from_pretrained(args.model_dir).to(device).eval()
