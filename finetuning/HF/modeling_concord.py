@@ -53,6 +53,7 @@ class ConcordConfig(PretrainedConfig):
         delta_chunk_size: int = 128,
         **kwargs,
     ):
+        kwargs["tie_word_embeddings"] = tie_embeddings
         super().__init__(**kwargs)
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -787,9 +788,8 @@ class ConcordModel(ConcordPreTrainedModel):
 class ConcordForCausalLM(ConcordPreTrainedModel, GenerationMixin):
 
     def __init__(self, config: ConcordConfig):
-        # Ensure HF's native tie_word_embeddings is set
-        if not hasattr(config, "tie_word_embeddings"):
-            config.tie_word_embeddings = config.tie_embeddings
+        # Ensure HF's native tie_word_embeddings is set correctly
+        config.tie_word_embeddings = config.tie_embeddings
         super().__init__(config)
         self.model = ConcordModel(config)
         self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
