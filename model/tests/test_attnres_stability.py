@@ -53,12 +53,16 @@ class TestAttnResStability:
             assert stats["attn_uniformity"] > 0.8
 
     def test_gradient_flows_to_pseudo_queries(self, config, device):
-        """Verify gradients reach the pseudo-queries."""
+        """
+        Verify gradients reach the pseudo-queries.
+        Needs >=2 sources since softmax of a single element always yields 1
+        and produces zero gradient to the query.
+        """
         attn_res = BlockAttnRes(
             d_model=config.d_model, n_layers=config.n_layers, n_blocks=config.n_groups
         ).to(device)
 
-        block_reprs = [torch.randn(1, 8, config.d_model, device=device)]
+        block_reprs = [torch.randn(1, 8, config.d_model, device=device) for _ in range(2)]
         partial = torch.randn(1, 8, config.d_model, device=device)
         target = torch.randn(1, 8, config.d_model, device=device)
 
@@ -70,17 +74,26 @@ class TestAttnResStability:
         assert attn_res.pseudo_queries.grad.abs().max().item() > 0
 
     def test_block_reprs_detach_prevents_backprop(self, config, device):
-        """Block representations should be detached."""
+        """
+        Block representations should be detached.
+        partial_residual is NOT an attention source, so no grad through it either.
+        Needs >=2 sources (one detached, one attached) for non-zero gradient to
+        pseudo_queries (softmax of single element yields zero gradient to query).
+        """
         attn_res = BlockAttnRes(
             d_model=config.d_model, n_layers=config.n_layers, n_blocks=config.n_groups
         ).to(device)
 
-        source = torch.randn(1, 8, config.d_model, device=device, requires_grad=True)
-        block_reprs = [source.detach()]
+        detached_src = torch.randn(1, 8, config.d_model, device=device, requires_grad=True)
+        attached_src = torch.randn(1, 8, config.d_model, device=device, requires_grad=True)
+        block_reprs = [detached_src.detach(), attached_src]
         partial = torch.randn(1, 8, config.d_model, device=device, requires_grad=True)
 
         out = attn_res(layer_idx=0, block_reprs=block_reprs, partial_residual=partial)
         out.sum().backward()
 
-        assert partial.grad is not None
-        assert source.grad is None, "Gradient leaked through detached block_repr"
+        assert detached_src.grad is None, "Gradient leaked through detached block_repr"
+        assert attached_src.grad is not None, "Gradient should flow through attached source"
+        assert partial.grad is None, "partial_residual is not an attention source"
+        assert attn_res.pseudo_queries.grad is not None
+        assert attn_res.pseudo_queries.grad.abs().max().item() > 0

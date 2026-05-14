@@ -92,8 +92,12 @@ class DeltaBlock(nn.Module):
             delta_state: updated recurrent state
             aux_loss: MoE auxiliary load balancing loss
         """
-        # AttnRes → DeltaNet sublayer (residual: input + attn_res + sublayer)
+        # Single AttnRes call — shared by both sublayers.
+        # Since partial_residual is NOT included as an attention source,
+        # both sublayers receive the same inter-block context from completed blocks.
         x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
+
+        # AttnRes → DeltaNet sublayer
         delta_out, delta_state = self.delta_net(self.norm1(x_res))
         x = x + x_res + delta_out
         partial_residual = partial_residual + x
@@ -105,10 +109,9 @@ class DeltaBlock(nn.Module):
                 partial_residual
             )
 
-        # AttnRes → MoE sublayer
-        x_res2 = self._attn_res(self.layer_idx, block_reprs, partial_residual)
-        moe_out, aux_loss = self.moe(self.norm2(x_res2))
-        x = x + x_res2 + moe_out
+        # AttnRes → MoE sublayer (reuses same x_res)
+        moe_out, aux_loss = self.moe(self.norm2(x_res))
+        x = x + x_res + moe_out
         partial_residual = partial_residual + x
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:

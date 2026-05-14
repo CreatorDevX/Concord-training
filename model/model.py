@@ -305,7 +305,8 @@ class HybridMoE(nn.Module):
             coords["y"] = torch.zeros_like(position_ids).float()
 
         # ── Block processing with AttnRes ──────────────────────────────
-        block_reprs: List[torch.Tensor] = []
+        # b0 = h1 per paper: token embedding is always the first source
+        block_reprs: List[torch.Tensor] = [x.detach()]
         partial_residual = torch.zeros_like(x)
         new_delta_states = []
         delta_state_idx = 0

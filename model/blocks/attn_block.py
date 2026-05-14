@@ -98,8 +98,10 @@ class AttnBlock(nn.Module):
             partial_residual: (B, T, d_model) — updated partial residual
             aux_loss: MoE auxiliary load balancing loss
         """
-        # AttnRes → Attention sublayer (residual: input + attn_res + sublayer)
+        # Single AttnRes call — shared by both sublayers.
         x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
+
+        # AttnRes → Attention sublayer
         attn_out = self.attention(self.norm1(x_res), position_ids, coords=coords)
         x = x + x_res + attn_out
         partial_residual = partial_residual + x
@@ -111,10 +113,9 @@ class AttnBlock(nn.Module):
                 partial_residual
             )
 
-        # AttnRes → MoE sublayer
-        x_res2 = self._attn_res(self.layer_idx, block_reprs, partial_residual)
-        moe_out, aux_loss = self.moe(self.norm2(x_res2))
-        x = x + x_res2 + moe_out
+        # AttnRes → MoE sublayer (reuses same x_res)
+        moe_out, aux_loss = self.moe(self.norm2(x_res))
+        x = x + x_res + moe_out
         partial_residual = partial_residual + x
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
