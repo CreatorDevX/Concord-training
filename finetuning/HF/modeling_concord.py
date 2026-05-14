@@ -475,7 +475,7 @@ class GatedDeltaNet(nn.Module):
 
         if state is None:
             state = torch.zeros(B, self.n_qk_heads, self.head_dim, head_dim_v,
-                                device=x.device, dtype=x.dtype)
+                                 device=x.device, dtype=x.dtype)
 
         gate_input = torch.sigmoid(self.gate_proj(x))
         with torch.no_grad():
@@ -812,10 +812,10 @@ class ConcordForCausalLM(ConcordPreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def tie_weights(self):
+    def tie_weights(self, *args, **kwargs):
         if hasattr(self, "config") and self.config.tie_embeddings:
             self.lm_head.weight = self.model.embed.weight
-        super().tie_weights()
+        super().tie_weights(*args, **kwargs)
 
     def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
                 delta_states: Optional[List[torch.Tensor]] = None, return_dict: bool = True,
