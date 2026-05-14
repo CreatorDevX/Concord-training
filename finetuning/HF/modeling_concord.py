@@ -347,7 +347,11 @@ class GatedAttention(nn.Module):
         float_mask = torch.where(attn_mask, torch.tensor(0.0, device=q.device, dtype=q.dtype),
                                  torch.tensor(float('-inf'), device=q.device, dtype=q.dtype))
         if w_q is not None and w_k is not None:
-            float_mask = float_mask + self.temporal_bias(w_q, w_k)
+            w_k_comp = w_k[:, self.compress_ratio - 1::self.compress_ratio]
+            if w_k_comp.shape[1] < T_comp:
+                pad_len = T_comp - w_k_comp.shape[1]
+                w_k_comp = torch.cat([w_k_comp, w_k_comp[:, -1:].expand(-1, pad_len)], dim=1)
+            float_mask = float_mask + self.temporal_bias(w_q, w_k_comp)
         return F.scaled_dot_product_attention(q, k_exp, v_exp, attn_mask=float_mask)
 
     def forward(self, x: torch.Tensor, coords: Optional[Dict[str, torch.Tensor]] = None) -> torch.Tensor:
