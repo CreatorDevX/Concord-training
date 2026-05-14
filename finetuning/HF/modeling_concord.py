@@ -788,8 +788,8 @@ class ConcordModel(ConcordPreTrainedModel):
 class ConcordForCausalLM(ConcordPreTrainedModel, GenerationMixin):
     # Provide _tied_weights_keys as a dictionary to avoid the "AttributeError: 'list' object has no attribute 'keys'" 
     # bug in specific HF transformers versions, while still successfully registering the tied weights.
-    _tied_weights_keys = {"lm_head.weight": None}
-    all_tied_weights_keys = {"lm_head.weight": None}
+    _tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
+    all_tied_weights_keys = {"lm_head.weight": "model.embed.weight"}
 
     def __init__(self, config: ConcordConfig):
         # Ensure HF's native tie_word_embeddings is set correctly
