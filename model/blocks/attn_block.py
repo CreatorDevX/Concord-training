@@ -1,7 +1,8 @@
 """
 AttnBlock — Attention (CSA or HCA) + MoE + AttnRes.
 
-Same integration pattern as DeltaBlock but using Gated Attention instead of DeltaNet.
+Same integration pattern as DeltaBlock: partial accumulates only sublayer
+outputs for compressed block representations.
 Even-indexed attention layers → CSA, odd → HCA.
 """
 
@@ -104,7 +105,8 @@ class AttnBlock(nn.Module):
         # AttnRes → Attention sublayer
         attn_out = self.attention(self.norm1(x_res), position_ids, coords=coords)
         x = x + x_res + attn_out
-        partial_residual = partial_residual + x
+        # Partial accumulates only sublayer outputs (compressed block representation)
+        partial_residual = partial_residual + attn_out
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
             partial_residual = torch.where(
@@ -116,7 +118,7 @@ class AttnBlock(nn.Module):
         # AttnRes → MoE sublayer (reuses same x_res)
         moe_out, aux_loss = self.moe(self.norm2(x_res))
         x = x + x_res + moe_out
-        partial_residual = partial_residual + x
+        partial_residual = partial_residual + moe_out
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
             x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)

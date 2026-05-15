@@ -617,14 +617,33 @@ class BlockAttnRes(nn.Module):
         self.scale = 1.0 / math.sqrt(d_model)
 
     def forward(self, layer_idx: int, block_reprs: List[torch.Tensor], partial_residual: torch.Tensor) -> torch.Tensor:
-        sources = block_reprs + [partial_residual]
-        stacked = torch.stack(sources, dim=2)
-        stacked_norm = self.norm(stacked)
-        keys = self.k_proj(stacked_norm)
-        q = self.pseudo_queries[layer_idx].view(1, 1, 1, -1)
-        attn_logits = (q * keys).sum(dim=-1) * self.scale
+        sources = block_reprs
+        n_sources = len(sources)
+        if n_sources == 0:
+            return torch.zeros_like(partial_residual)
+
+        B, T = partial_residual.shape[0], partial_residual.shape[1]
+        for s in sources:
+            if s.shape != (B, T, self.d_model):
+                raise ValueError(f"Expected source shape ({B}, {T}, {self.d_model}), got {s.shape}")
+        if n_sources > self.n_blocks:
+            raise ValueError(f"Number of sources ({n_sources}) exceeds n_blocks ({self.n_blocks}). "
+                             "block_reprs must be compressed (1 per block, not per layer).")
+
+        q = self.pseudo_queries[layer_idx].view(1, 1, -1)
+        attn_logits = []
+        for s in sources:
+            s_norm = self.norm(s)
+            k = self.k_proj(s_norm)
+            logit = (q * k).sum(dim=-1) * self.scale
+            attn_logits.append(logit)
+        attn_logits = torch.stack(attn_logits, dim=-1)
         attn_weights = F.softmax(attn_logits, dim=-1)
-        return (attn_weights.unsqueeze(-1) * stacked).sum(dim=2)
+
+        output = torch.zeros_like(sources[0])
+        for i, w in enumerate(attn_weights.unbind(dim=-1)):
+            output = output + w.unsqueeze(-1) * sources[i]
+        return output
 
 
 class DeltaBlock(nn.Module):
@@ -651,14 +670,13 @@ class DeltaBlock(nn.Module):
         x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
         delta_out, delta_state = self.delta_net(self.norm1(x_res), delta_state)
         x = x + x_res + delta_out
-        partial_residual = partial_residual + x
+        partial_residual = partial_residual + delta_out
         if x.dtype in (torch.float16, torch.bfloat16):
             partial_residual = torch.where(torch.isnan(partial_residual) | torch.isinf(partial_residual),
                                            torch.zeros_like(partial_residual), partial_residual)
-        x_res2 = self._attn_res(self.layer_idx, block_reprs, partial_residual)
-        moe_out, aux_loss = self.moe(self.norm2(x_res2))
-        x = x + x_res2 + moe_out
-        partial_residual = partial_residual + x
+        moe_out, aux_loss = self.moe(self.norm2(x_res))
+        x = x + x_res + moe_out
+        partial_residual = partial_residual + moe_out
         return x, partial_residual, delta_state, aux_loss
 
 
@@ -691,14 +709,13 @@ class AttnBlock(nn.Module):
         x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
         attn_out = self.attention(self.norm1(x_res), coords=coords)
         x = x + x_res + attn_out
-        partial_residual = partial_residual + x
+        partial_residual = partial_residual + attn_out
         if x.dtype in (torch.float16, torch.bfloat16):
             partial_residual = torch.where(torch.isnan(partial_residual) | torch.isinf(partial_residual),
                                            torch.zeros_like(partial_residual), partial_residual)
-        x_res2 = self._attn_res(self.layer_idx, block_reprs, partial_residual)
-        moe_out, aux_loss = self.moe(self.norm2(x_res2))
-        x = x + x_res2 + moe_out
-        partial_residual = partial_residual + x
+        moe_out, aux_loss = self.moe(self.norm2(x_res))
+        x = x + x_res + moe_out
+        partial_residual = partial_residual + moe_out
         return x, partial_residual, aux_loss
 
 
@@ -764,7 +781,7 @@ class ConcordModel(ConcordPreTrainedModel):
             coords = {"u": position_ids, "w": torch.zeros_like(position_ids).float(),
                       "x": torch.zeros_like(position_ids).float(), "y": torch.zeros_like(position_ids).float()}
 
-        block_reprs = []
+        block_reprs = [x.detach()]
         partial_residual = torch.zeros_like(x)
         new_delta_states = []
         delta_state_idx = 0

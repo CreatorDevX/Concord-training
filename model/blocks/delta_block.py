@@ -1,13 +1,15 @@
 """
 DeltaBlock — DeltaNet + MoE + AttnRes.
 
-Integration pattern per spec Section 3.5:
+Integration pattern:
     x_res = attn_res(layer_idx, block_reprs, partial_residual)
-    x = x_res + sublayer1(norm1(x_res))   # DeltaNet
-    partial_residual = partial_residual + x
-    x_res2 = attn_res(layer_idx, block_reprs, partial_residual)
-    x = x_res2 + sublayer2(norm2(x_res2)) # MoE
-    partial_residual = partial_residual + x
+    x = x + x_res + sublayer1(norm1(x_res))   # DeltaNet
+    partial_residual = partial_residual + sublayer1_out
+    x = x + x_res + sublayer2(norm2(x_res))   # MoE
+    partial_residual = partial_residual + sublayer2_out
+
+Partial accumulates only sublayer outputs (compressed block representation
+per the AttnRes paper). Standard residuals carry the full hidden state.
 """
 
 import torch
@@ -93,14 +95,13 @@ class DeltaBlock(nn.Module):
             aux_loss: MoE auxiliary load balancing loss
         """
         # Single AttnRes call — shared by both sublayers.
-        # Since partial_residual is NOT included as an attention source,
-        # both sublayers receive the same inter-block context from completed blocks.
         x_res = self._attn_res(self.layer_idx, block_reprs, partial_residual)
 
         # AttnRes → DeltaNet sublayer
         delta_out, delta_state = self.delta_net(self.norm1(x_res))
         x = x + x_res + delta_out
-        partial_residual = partial_residual + x
+        # Partial accumulates only sublayer outputs (compressed block representation)
+        partial_residual = partial_residual + delta_out
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
             partial_residual = torch.where(
@@ -112,7 +113,7 @@ class DeltaBlock(nn.Module):
         # AttnRes → MoE sublayer (reuses same x_res)
         moe_out, aux_loss = self.moe(self.norm2(x_res))
         x = x + x_res + moe_out
-        partial_residual = partial_residual + x
+        partial_residual = partial_residual + moe_out
 
         if x.dtype == torch.float16 or x.dtype == torch.bfloat16:
             x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
